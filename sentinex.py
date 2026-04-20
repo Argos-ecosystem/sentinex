@@ -270,24 +270,24 @@ class CameraStream:
 # ============================================================
 
 def analyze_llm(camera_name, frame) -> dict:
-    img_b64 = to_b64_jpg(frame)
-    img_data_uri = f"data:image/jpeg;base64,{img_b64}"
-    system_prompt = os.getenv(f"SYSTEM_PROMPT_{camera_name}", "")
-
-    payload = {
-        "model": MODEL_NAME,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": [{"type": "image_url", "image_url": {"url": img_data_uri}}]},
-        ],
-        "temperature": 0.1,
-        "max_tokens": 300,
-    }
-
-    url = LM_API + LM_PATH
-    headers = {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"}
-
     try:
+        img_b64 = to_b64_jpg(frame)
+        img_data_uri = f"data:image/jpeg;base64,{img_b64}"
+        system_prompt = os.getenv(f"SYSTEM_PROMPT_{camera_name}", "")
+
+        payload = {
+            "model": MODEL_NAME,
+            "messages": [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": [{"type": "image_url", "image_url": {"url": img_data_uri}}]},
+            ],
+            "temperature": 0.1,
+            "max_tokens": 300,
+        }
+
+        url = LM_API + LM_PATH
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"}
+
         r = requests.post(url, json=payload, headers=headers, timeout=180) 
         r.raise_for_status()
         raw = r.json()["choices"][0]["message"]["content"]
@@ -295,7 +295,8 @@ def analyze_llm(camera_name, frame) -> dict:
         return {"score": float(parsed.get("score", 0.0)), "text": str(parsed.get("description") or ""), "b64": img_b64}
     except Exception as e:
         log(f"❌ LLM Error ({camera_name}): {e}", "error")
-        return {"score": 0.0, "text": "LLM Analysis Error", "b64": img_b64}
+        b64_val = img_b64 if 'img_b64' in locals() else ""
+        return {"score": 0.0, "text": "LLM Analysis Error", "b64": b64_val}
 
 
 def process_camera_analysis(stream: CameraStream):
@@ -307,54 +308,56 @@ def process_camera_analysis(stream: CameraStream):
     last_siren_alert_at = 0.0
 
     while not stream.stopped:
-        frame = stream.read() 
-        if frame is None:
-            time.sleep(1)
-            continue
-        
-        frame = resize_if_needed(frame)
-        res = analyze_llm(name, frame) 
-        save_last_frame(name, frame)
-
-        score = res["score"]
-        text = res["text"]
-        log(f"[{name}] score={score:.2f} | {text}")
-
-        # === LEVEL 1: CRITICAL THREAT (SIREN) ===
-        if score >= SCORE_CRITICAL:
-            caption = f"🚨🔴 CRITICAL: {name} | Score={score:.2f}\n{text}"
-            # Capture video clip in background thread to not block siren
-            Thread(
-                target=_capture_and_send_video_clip,
-                args=(stream, name, caption, res["b64"]),
-                daemon=True
-            ).start()
+        try:
+            frame = stream.read() 
+            if frame is None:
+                time.sleep(1)
+                continue
             
-            now = time.time()
-            if now - last_siren_alert_at >= SIREN_COOLDOWN:
-                play_siren_file()
-                last_siren_alert_at = now
-            else:
-                log("⏳ Siren cooling down...")
+            frame = resize_if_needed(frame)
+            res = analyze_llm(name, frame) 
+            save_last_frame(name, frame)
 
-        # === LEVEL 2: WARNING (TTS) ===
-        elif score >= SCORE_THRESHOLD: 
-            caption = f"⚠️ {name}: {text} | Risk={score:.2f}"
-            Thread(
-                target=_capture_and_send_video_clip,
-                args=(stream, name, caption, res["b64"]),
-                daemon=True
-            ).start()
-            if TTS_ENABLED:
+            score = res["score"]
+            text = res["text"]
+            log(f"[{name}] score={score:.2f} | {text}")
+
+            # === LEVEL 1: CRITICAL THREAT (SIREN) ===
+            if score >= SCORE_CRITICAL:
+                caption = f"🚨🔴 CRITICAL: {name} | Score={score:.2f}\n{text}"
+                # Capture video clip in background thread to not block siren
+                Thread(
+                    target=_capture_and_send_video_clip,
+                    args=(stream, name, caption, res["b64"]),
+                    daemon=True
+                ).start()
+                
                 now = time.time()
-                if now - last_tts_alert_at >= TTS_COOLDOWN:
-                    log(f"🔊 Playing TTS for {name}")
-                    play_audio_tts(TTS_MESSAGE, TTS_LANG, repeats=2, delay=1.0)
-                    last_tts_alert_at = now
-        
-        inject_omnistatus(name, text, score)
-        
+                if now - last_siren_alert_at >= SIREN_COOLDOWN:
+                    play_siren_file()
+                    last_siren_alert_at = now
+                else:
+                    log("⏳ Siren cooling down...")
 
+            # === LEVEL 2: WARNING (TTS) ===
+            elif score >= SCORE_THRESHOLD: 
+                caption = f"⚠️ {name}: {text} | Risk={score:.2f}"
+                Thread(
+                    target=_capture_and_send_video_clip,
+                    args=(stream, name, caption, res["b64"]),
+                    daemon=True
+                ).start()
+                if TTS_ENABLED:
+                    now = time.time()
+                    if now - last_tts_alert_at >= TTS_COOLDOWN:
+                        log(f"🔊 Playing TTS for {name}")
+                        play_audio_tts(TTS_MESSAGE, TTS_LANG, repeats=2, delay=1.0)
+                        last_tts_alert_at = now
+            
+            inject_omnistatus(name, text, score)
+            
+        except Exception as e:
+            log(f"❌ Unexpected Error in consumer loop ({name}): {e}", "error")
 
         time.sleep(INTERVAL)
 
