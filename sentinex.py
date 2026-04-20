@@ -11,6 +11,8 @@ import json
 import logging
 import io
 import socket
+import tempfile
+from collections import deque
 from logging.handlers import RotatingFileHandler
 from threading import Thread, Lock
 from datetime import datetime
@@ -53,7 +55,7 @@ LAST_FRAME_DIR = os.getenv("LAST_FRAME_DIR", "last_frames")
 LM_API = os.getenv("LM_STUDIO_API", "").rstrip("/")
 LM_PATH = os.getenv("LM_STUDIO_PATH", "/chat/completions")
 MODEL_NAME = os.getenv("MODEL_NAME", "qwen3-vl-8b")
-API_KEY = os.getenv("API_KEY")  
+API_KEY = os.getenv("LM_STUDIO_API_KEY", "lm-studio")  
 
 # --- DECISION THRESHOLDS ---
 SCORE_THRESHOLD = float(os.getenv("SCORE_THRESHOLD", "0.25")) # Warning
@@ -75,6 +77,11 @@ TTS_COOLDOWN = float(os.getenv("TTS_COOLDOWN", "60"))
 # AQUI: Asegúrate que este nombre coincida con tu archivo generado
 SIREN_FILE = os.getenv("SIREN_FILE", "alarma_infernal.wav") 
 SIREN_COOLDOWN = float(os.getenv("SIREN_COOLDOWN", "30"))
+
+# Video Clip Settings (for Telegram alerts)
+CLIP_PRE_SECONDS = float(os.getenv("CLIP_PRE_SECONDS", "3"))   # Seconds of video BEFORE the event
+CLIP_POST_SECONDS = float(os.getenv("CLIP_POST_SECONDS", "3")) # Seconds of video AFTER the event
+CLIP_FPS = float(os.getenv("CLIP_FPS", "8"))                   # FPS for the output clip
 
 # Heartbeat
 HEARTBEAT_ENABLED = os.getenv("HEARTBEAT_ENABLED", "1") 
@@ -123,7 +130,7 @@ def resize_if_needed(frame):
 
 
 def to_b64_jpg(frame):
-    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 60])
     if not ok:
         raise RuntimeError("Failed to encode frame to JPEG")
     return base64.b64encode(buf).decode("utf-8")
@@ -186,13 +193,17 @@ def play_siren_file():
 
 
 class CameraStream:
-    """Producer: Captures frames and keeps only the most recent one."""
+    """Producer: Captures frames and keeps only the most recent one.
+    Also maintains a rolling buffer of recent frames for video clip generation."""
     def __init__(self, name, url):
         self.name = name
         self.url = url
         self.frame = None
         self.lock = Lock()
         self.stopped = False
+        # Rolling buffer: keep enough frames for CLIP_PRE_SECONDS at CLIP_FPS
+        buffer_size = int(CLIP_PRE_SECONDS * CLIP_FPS) + 10  # small margin
+        self.frame_buffer = deque(maxlen=buffer_size)
         self.thread = Thread(target=self._update, daemon=True)
         self.thread.start()
 
@@ -224,6 +235,7 @@ class CameraStream:
                 
                 with self.lock:
                     self.frame = frame
+                    self.frame_buffer.append(frame.copy())
                 time.sleep(0.01)
             
             cap.release()
@@ -231,6 +243,23 @@ class CameraStream:
     def read(self):
         with self.lock:
             return self.frame.copy() if self.frame is not None else None
+
+    def get_buffer_snapshot(self):
+        """Return a copy of the current frame buffer."""
+        with self.lock:
+            return list(self.frame_buffer)
+
+    def capture_post_event_frames(self, duration_seconds: float, fps: float) -> list:
+        """Capture additional frames after an event for the specified duration."""
+        num_frames = int(duration_seconds * fps)
+        frames = []
+        interval = 1.0 / fps if fps > 0 else 0.125
+        for _ in range(num_frames):
+            time.sleep(interval)
+            frame = self.read()
+            if frame is not None:
+                frames.append(frame)
+        return frames
 
     def stop(self):
         self.stopped = True
@@ -252,14 +281,14 @@ def analyze_llm(camera_name, frame) -> dict:
             {"role": "user", "content": [{"type": "image_url", "image_url": {"url": img_data_uri}}]},
         ],
         "temperature": 0.1,
-        "max_tokens": 700,
+        "max_tokens": 300,
     }
 
     url = LM_API + LM_PATH
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"}
 
     try:
-        r = requests.post(url, json=payload, headers=headers, timeout=60) 
+        r = requests.post(url, json=payload, headers=headers, timeout=180) 
         r.raise_for_status()
         raw = r.json()["choices"][0]["message"]["content"]
         parsed = json.loads(raw)
@@ -270,7 +299,8 @@ def analyze_llm(camera_name, frame) -> dict:
 
 
 def process_camera_analysis(stream: CameraStream):
-    """Consumer: Pulls frame, analyzes it, triggers alerts based on SCORE."""
+    """Consumer: Pulls frame, analyzes it, triggers alerts based on SCORE.
+    On alert, captures a mini video clip and sends it to Telegram."""
     name = stream.name
     log(f"🧠 Consumer {name} started.")
     last_tts_alert_at = 0.0
@@ -292,7 +322,13 @@ def process_camera_analysis(stream: CameraStream):
 
         # === LEVEL 1: CRITICAL THREAT (SIREN) ===
         if score >= SCORE_CRITICAL:
-            send_telegram(res["b64"], f"🚨🔴 CRITICAL: {name} | Score={score:.2f}\n{text}")
+            caption = f"🚨🔴 CRITICAL: {name} | Score={score:.2f}\n{text}"
+            # Capture video clip in background thread to not block siren
+            Thread(
+                target=_capture_and_send_video_clip,
+                args=(stream, name, caption, res["b64"]),
+                daemon=True
+            ).start()
             
             now = time.time()
             if now - last_siren_alert_at >= SIREN_COOLDOWN:
@@ -303,7 +339,12 @@ def process_camera_analysis(stream: CameraStream):
 
         # === LEVEL 2: WARNING (TTS) ===
         elif score >= SCORE_THRESHOLD: 
-            send_telegram(res["b64"], f"⚠️ {name}: {text} | Risk={score:.2f}")
+            caption = f"⚠️ {name}: {text} | Risk={score:.2f}"
+            Thread(
+                target=_capture_and_send_video_clip,
+                args=(stream, name, caption, res["b64"]),
+                daemon=True
+            ).start()
             if TTS_ENABLED:
                 now = time.time()
                 if now - last_tts_alert_at >= TTS_COOLDOWN:
@@ -321,7 +362,111 @@ def process_camera_analysis(stream: CameraStream):
 # MAIN
 # ============================================================
 
-def send_telegram(img_b64: str, caption: str):
+def _capture_and_send_video_clip(stream: CameraStream, camera_name: str, caption: str, fallback_b64: str):
+    """Captures pre+post event frames, builds a video clip, and sends it to Telegram.
+    Falls back to sending a photo if video generation fails."""
+    try:
+        log(f"🎬 [{camera_name}] Capturing video clip ({CLIP_PRE_SECONDS}s pre + {CLIP_POST_SECONDS}s post)...")
+        
+        # 1. Get pre-event frames from the rolling buffer
+        pre_frames = stream.get_buffer_snapshot()
+        
+        # 2. Capture post-event frames (this blocks for CLIP_POST_SECONDS)
+        post_frames = stream.capture_post_event_frames(CLIP_POST_SECONDS, CLIP_FPS)
+        
+        # 3. Combine all frames
+        all_frames = pre_frames + post_frames
+        
+        if len(all_frames) < 4:
+            log(f"⚠️ [{camera_name}] Not enough frames for video ({len(all_frames)}). Sending photo instead.", "warning")
+            send_telegram_photo(fallback_b64, caption)
+            return
+        
+        # 4. Resize all frames consistently
+        all_frames = [resize_if_needed(f) for f in all_frames]
+        
+        # 5. Build MP4 clip
+        video_path = build_video_clip(all_frames, camera_name, CLIP_FPS)
+        
+        if video_path and os.path.exists(video_path):
+            send_telegram_video(video_path, caption)
+            # Clean up temp file
+            try:
+                os.remove(video_path)
+            except OSError:
+                pass
+        else:
+            log(f"⚠️ [{camera_name}] Video build failed. Sending photo instead.", "warning")
+            send_telegram_photo(fallback_b64, caption)
+            
+    except Exception as e:
+        log(f"❌ [{camera_name}] Video clip error: {e}. Sending photo.", "error")
+        send_telegram_photo(fallback_b64, caption)
+
+
+def build_video_clip(frames: list, camera_name: str, fps: float) -> str:
+    """Writes a list of frames to a temporary MP4 file. Returns the file path."""
+    if not frames:
+        return None
+    
+    try:
+        h, w = frames[0].shape[:2]
+        
+        # Create temp file for the video
+        tmp_fd, tmp_path = tempfile.mkstemp(suffix=".mp4", prefix=f"sentinex_{camera_name}_")
+        os.close(tmp_fd)
+        
+        fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+        writer = cv2.VideoWriter(tmp_path, fourcc, fps, (w, h))
+        
+        if not writer.isOpened():
+            log(f"❌ Failed to open VideoWriter for {camera_name}", "error")
+            return None
+        
+        for frame in frames:
+            # Ensure frame matches expected dimensions
+            if frame.shape[:2] != (h, w):
+                frame = cv2.resize(frame, (w, h))
+            writer.write(frame)
+        
+        writer.release()
+        
+        file_size = os.path.getsize(tmp_path)
+        duration = len(frames) / fps if fps > 0 else 0
+        log(f"🎬 [{camera_name}] Video clip ready: {len(frames)} frames, {duration:.1f}s, {file_size/1024:.0f}KB")
+        
+        return tmp_path
+        
+    except Exception as e:
+        log(f"❌ Video build error ({camera_name}): {e}", "error")
+        return None
+
+
+def send_telegram_video(video_path: str, caption: str):
+    """Send a video clip to Telegram using sendVideo API."""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendVideo"
+        data = {
+            "chat_id": TELEGRAM_CHAT_ID,
+            "caption": caption[:1024],
+            "supports_streaming": "true",
+        }
+        with open(video_path, "rb") as vf:
+            files = {"video": ("alert_clip.mp4", vf, "video/mp4")}
+            r = requests.post(url, data=data, files=files, timeout=60)
+        
+        if r.status_code == 200:
+            log(f"📤 Telegram video sent successfully.")
+        else:
+            log(f"⚠️ Telegram sendVideo returned {r.status_code}: {r.text[:200]}", "warning")
+    except Exception as e:
+        log(f"❌ Telegram video send error: {e}", "error")
+
+
+def send_telegram_photo(img_b64: str, caption: str):
+    """Send a photo to Telegram (fallback when video fails)."""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
