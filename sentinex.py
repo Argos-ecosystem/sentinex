@@ -10,10 +10,12 @@ import requests
 import json
 import logging
 import io
+import re
 import socket
 from logging.handlers import RotatingFileHandler
 from threading import Thread, Lock
 from datetime import datetime
+from typing import List, Optional
 
 
 from dotenv import load_dotenv
@@ -47,13 +49,31 @@ CAMERAS = load_cameras_from_env()
 # Frame and Scaling settings
 FRAME_MAX_WIDTH = int(os.getenv("FRAME_MAX_WIDTH", "960"))
 INTERVAL = float(os.getenv("INTERVAL", "0")) # Set to 0 for max speed
+JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "70"))
 LAST_FRAME_DIR = os.getenv("LAST_FRAME_DIR", "last_frames")
+MOTION_FILTER_ENABLED = os.getenv("MOTION_FILTER_ENABLED", "1") == "1"
+MOTION_DOWNSCALE_WIDTH = int(os.getenv("MOTION_DOWNSCALE_WIDTH", "320"))
+MOTION_DIFF_THRESHOLD = int(os.getenv("MOTION_DIFF_THRESHOLD", "24"))
+MOTION_MIN_CHANGED_RATIO = float(os.getenv("MOTION_MIN_CHANGED_RATIO", "0.002"))
+MOTION_CROP_ENABLED = os.getenv("MOTION_CROP_ENABLED", "1") == "1"
+MOTION_CROP_PADDING = float(os.getenv("MOTION_CROP_PADDING", "0.18"))
+MOTION_CROP_MAX_AREA_RATIO = float(os.getenv("MOTION_CROP_MAX_AREA_RATIO", "0.75"))
+MOTION_SKIP_LOW_CHANGE = os.getenv("MOTION_SKIP_LOW_CHANGE", "0") == "1"
+FULL_FRAME_EVERY_SECONDS = float(os.getenv("FULL_FRAME_EVERY_SECONDS", "300"))
+MOTION_SKIP_SLEEP_SECONDS = float(os.getenv("MOTION_SKIP_SLEEP_SECONDS", "1"))
+MOTION_MAX_SKIPS_BEFORE_ANALYSIS = int(os.getenv("MOTION_MAX_SKIPS_BEFORE_ANALYSIS", "10"))
 
 # LLM API Settings
 LM_API = os.getenv("LM_STUDIO_API", "").rstrip("/")
 LM_PATH = os.getenv("LM_STUDIO_PATH", "/chat/completions")
 MODEL_NAME = os.getenv("MODEL_NAME", "qwen3-vl-8b")
-API_KEY = os.getenv("API_KEY")  
+API_KEY = os.getenv("API_KEY")
+LM_TIMEOUT = float(os.getenv("LM_TIMEOUT", "60"))
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "220"))
+
+# Persistent HTTP session to reuse keep-alive connections and avoid repeated TCP handshakes
+HTTP_SESSION = requests.Session()
+HTTP_SESSION.trust_env = False
 
 # --- DECISION THRESHOLDS ---
 SCORE_THRESHOLD = float(os.getenv("SCORE_THRESHOLD", "0.25")) # Warning
@@ -64,6 +84,9 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 ENABLE_OMNISTATUS = os.getenv("ENABLE_OMNISTATUS", "0") 
 OMNISTATUS_API = os.getenv("OMNISTATUS_ENDPOINT")
+OMNISTATUS_DEDUP_ENABLED = os.getenv("OMNISTATUS_DEDUP_ENABLED", "1") == "1"
+OMNISTATUS_DEDUP_WINDOW_SECONDS = float(os.getenv("OMNISTATUS_DEDUP_WINDOW_SECONDS", "30"))
+OMNISTATUS_DEDUP_MAX_SAMPLES = int(os.getenv("OMNISTATUS_DEDUP_MAX_SAMPLES", "3"))
 
 # TTS (Text-to-Speech) - WARNING LEVEL
 TTS_ENABLED = os.getenv("TTS_ENABLED", "0") == "1"
@@ -110,6 +133,122 @@ def log(msg, level="info"):
     else: logger.info(msg)
 
 
+_omnistatus_groups = {}
+_omnistatus_groups_lock = Lock()
+
+
+def normalize_event_text(text: str) -> str:
+    normalized = re.sub(r"\W+", " ", (text or "").lower(), flags=re.UNICODE)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def utc_iso() -> str:
+    return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
+
+def new_omnistatus_group(source: str, text: str, score: float, image_b64: Optional[str], now: float) -> dict:
+    return {
+        "source": source,
+        "text": text,
+        "score_sum": float(score),
+        "score_max": float(score),
+        "count": 1,
+        "first_seen": utc_iso(),
+        "last_seen": utc_iso(),
+        "first_seen_ts": now,
+        "last_seen_ts": now,
+        "image_b64": image_b64,
+        "samples": [text] if text else [],
+    }
+
+
+def update_omnistatus_group(group: dict, text: str, score: float, image_b64: Optional[str], now: float) -> None:
+    group["count"] += 1
+    group["score_sum"] += float(score)
+    group["score_max"] = max(float(group["score_max"]), float(score))
+    group["last_seen"] = utc_iso()
+    group["last_seen_ts"] = now
+    if image_b64:
+        group["image_b64"] = image_b64
+    if text and text not in group["samples"] and len(group["samples"]) < OMNISTATUS_DEDUP_MAX_SAMPLES:
+        group["samples"].append(text)
+
+
+def group_to_omnistatus_payload(group: dict) -> dict:
+    count = int(group["count"])
+    avg_score = group["score_sum"] / count if count else 0.0
+    text = group["text"]
+    if count > 1:
+        text = f"{text} (repeated {count} times)"
+
+    payload = {
+        "source": group["source"],
+        "text": text,
+        "summary": text,
+        "score": round(float(group["score_max"]), 4),
+        "avg_score": round(avg_score, 4),
+        "event_count": count,
+        "first_seen": group["first_seen"],
+        "last_seen": group["last_seen"],
+        "dedup_key": normalize_event_text(group["text"]),
+        "samples": group["samples"],
+    }
+    if group.get("image_b64"):
+        payload["image_b64"] = group["image_b64"]
+    return payload
+
+
+def collect_omnistatus_payloads(source: str, text: str, score: float, image_b64: Optional[str] = None) -> List[dict]:
+    if not OMNISTATUS_DEDUP_ENABLED:
+        payload = {"source": source, "text": text, "score": score, "event_count": 1}
+        if image_b64:
+            payload["image_b64"] = image_b64
+        return [payload]
+
+    now = time.time()
+    key = (source, normalize_event_text(text))
+    ready = []
+
+    with _omnistatus_groups_lock:
+        current = _omnistatus_groups.get(source)
+        if current and (source, normalize_event_text(current["text"])) == key:
+            update_omnistatus_group(current, text, score, image_b64, now)
+            if now - current["first_seen_ts"] >= OMNISTATUS_DEDUP_WINDOW_SECONDS:
+                ready.append(group_to_omnistatus_payload(current))
+                _omnistatus_groups.pop(source, None)
+            return ready
+
+        if current:
+            ready.append(group_to_omnistatus_payload(current))
+
+        _omnistatus_groups[source] = new_omnistatus_group(source, text, score, image_b64, now)
+
+    return ready
+
+
+def flush_due_omnistatus_payloads() -> List[dict]:
+    if not OMNISTATUS_DEDUP_ENABLED:
+        return []
+
+    now = time.time()
+    ready = []
+    with _omnistatus_groups_lock:
+        for source, group in list(_omnistatus_groups.items()):
+            if now - group["last_seen_ts"] >= OMNISTATUS_DEDUP_WINDOW_SECONDS:
+                ready.append(group_to_omnistatus_payload(group))
+                _omnistatus_groups.pop(source, None)
+    return ready
+
+
+def flush_all_omnistatus_payloads() -> List[dict]:
+    ready = []
+    with _omnistatus_groups_lock:
+        for source, group in list(_omnistatus_groups.items()):
+            ready.append(group_to_omnistatus_payload(group))
+            _omnistatus_groups.pop(source, None)
+    return ready
+
+
 # ============================================================
 # UTILS & PRODUCER CLASS
 # ============================================================
@@ -122,8 +261,8 @@ def resize_if_needed(frame):
     return frame
 
 
-def to_b64_jpg(frame):
-    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+def to_b64_jpg(frame, quality: int = JPEG_QUALITY):
+    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), quality])
     if not ok:
         raise RuntimeError("Failed to encode frame to JPEG")
     return base64.b64encode(buf).decode("utf-8")
@@ -139,6 +278,106 @@ def save_last_frame(camera_name: str, frame):
             log(f"⚠️ Failed to save frame for {camera_name}", "warning")
     except Exception as e:
         log(f"⚠️ Error saving frame for {camera_name}: {e}", "error")
+
+
+class FramePreprocessor:
+    """Keeps cheap per-camera state so repeated frames do not hit the VLLM."""
+    def __init__(self):
+        self.previous_gray = None
+        self.last_full_analysis_at = 0.0
+        self.consecutive_skips = 0
+
+    def _small_gray(self, frame):
+        height, width = frame.shape[:2]
+        if MOTION_DOWNSCALE_WIDTH and width > MOTION_DOWNSCALE_WIDTH:
+            scale = MOTION_DOWNSCALE_WIDTH / width
+            frame = cv2.resize(frame, (MOTION_DOWNSCALE_WIDTH, max(1, int(height * scale))), interpolation=cv2.INTER_AREA)
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    def prepare(self, frame):
+        if not MOTION_FILTER_ENABLED:
+            return frame, {"skipped": False, "reason": "disabled", "crop": False, "changed_ratio": 1.0}
+
+        now = time.time()
+        gray = self._small_gray(frame)
+        force_full = FULL_FRAME_EVERY_SECONDS > 0 and now - self.last_full_analysis_at >= FULL_FRAME_EVERY_SECONDS
+        force_after_skips = (
+            MOTION_MAX_SKIPS_BEFORE_ANALYSIS > 0
+            and self.consecutive_skips >= MOTION_MAX_SKIPS_BEFORE_ANALYSIS
+        )
+
+        if self.previous_gray is None or self.previous_gray.shape != gray.shape:
+            self.previous_gray = gray
+            self.last_full_analysis_at = now
+            self.consecutive_skips = 0
+            return frame, {"skipped": False, "reason": "first_frame", "crop": False, "changed_ratio": 1.0}
+
+        diff = cv2.absdiff(gray, self.previous_gray)
+        _, mask = cv2.threshold(diff, MOTION_DIFF_THRESHOLD, 255, cv2.THRESH_BINARY)
+        mask = cv2.medianBlur(mask, 5)
+        changed_ratio = cv2.countNonZero(mask) / mask.size
+        self.previous_gray = gray
+
+        low_change = changed_ratio < MOTION_MIN_CHANGED_RATIO
+        if low_change and MOTION_SKIP_LOW_CHANGE and not force_full and not force_after_skips:
+            self.consecutive_skips += 1
+            return None, {
+                "skipped": True,
+                "reason": "no_motion",
+                "crop": False,
+                "changed_ratio": changed_ratio,
+            }
+
+        self.last_full_analysis_at = now
+        self.consecutive_skips = 0
+        if low_change or force_full or force_after_skips or not MOTION_CROP_ENABLED:
+            return frame, {
+                "skipped": False,
+                "reason": (
+                    "low_change_full"
+                    if low_change
+                    else "periodic_full"
+                    if force_full
+                    else "skip_limit_full"
+                    if force_after_skips
+                    else "motion"
+                ),
+                "crop": False,
+                "changed_ratio": changed_ratio,
+            }
+
+        points = cv2.findNonZero(mask)
+        if points is None:
+            return frame, {"skipped": False, "reason": "motion", "crop": False, "changed_ratio": changed_ratio}
+
+        small_x, small_y, small_w, small_h = cv2.boundingRect(points)
+        full_h, full_w = frame.shape[:2]
+        scale_x = full_w / mask.shape[1]
+        scale_y = full_h / mask.shape[0]
+
+        x1 = int(small_x * scale_x)
+        y1 = int(small_y * scale_y)
+        x2 = int((small_x + small_w) * scale_x)
+        y2 = int((small_y + small_h) * scale_y)
+
+        pad_x = int((x2 - x1) * MOTION_CROP_PADDING)
+        pad_y = int((y2 - y1) * MOTION_CROP_PADDING)
+        x1 = max(0, x1 - pad_x)
+        y1 = max(0, y1 - pad_y)
+        x2 = min(full_w, x2 + pad_x)
+        y2 = min(full_h, y2 + pad_y)
+
+        crop_area_ratio = ((x2 - x1) * (y2 - y1)) / (full_w * full_h)
+        if crop_area_ratio <= 0 or crop_area_ratio >= MOTION_CROP_MAX_AREA_RATIO:
+            return frame, {"skipped": False, "reason": "motion_full", "crop": False, "changed_ratio": changed_ratio}
+
+        return frame[y1:y2, x1:x2], {
+            "skipped": False,
+            "reason": "motion_crop",
+            "crop": True,
+            "changed_ratio": changed_ratio,
+            "crop_area_ratio": crop_area_ratio,
+        }
 
 
 def play_audio_tts(text: str, lang: str = "es", repeats: int = 1, delay: float = 0.0):
@@ -243,7 +482,7 @@ class CameraStream:
 def analyze_llm(camera_name, frame) -> dict:
     img_b64 = to_b64_jpg(frame)
     img_data_uri = f"data:image/jpeg;base64,{img_b64}"
-    system_prompt = os.getenv(f"SYSTEM_PROMPT_{camera_name}", "")
+    system_prompt = os.getenv(f"SYSTEM_PROMPT_{camera_name}", os.getenv("SYSTEM_PROMPT", ""))
 
     payload = {
         "model": MODEL_NAME,
@@ -252,14 +491,14 @@ def analyze_llm(camera_name, frame) -> dict:
             {"role": "user", "content": [{"type": "image_url", "image_url": {"url": img_data_uri}}]},
         ],
         "temperature": 0.1,
-        "max_tokens": 700,
+        "max_tokens": LLM_MAX_TOKENS,
     }
 
     url = LM_API + LM_PATH
     headers = {"Content-Type": "application/json", "Authorization": f"Bearer {API_KEY}"}
 
     try:
-        r = requests.post(url, json=payload, headers=headers, timeout=60) 
+        r = HTTP_SESSION.post(url, json=payload, headers=headers, timeout=LM_TIMEOUT)
         r.raise_for_status()
         raw = r.json()["choices"][0]["message"]["content"]
         parsed = json.loads(raw)
@@ -275,22 +514,36 @@ def process_camera_analysis(stream: CameraStream):
     log(f"🧠 [{name}] Consumer started.")
     last_tts_alert_at = 0.0
     last_siren_alert_at = 0.0
+    preprocessor = FramePreprocessor()
 
     while not stream.stopped:
-        frame = stream.read() 
+        frame = stream.read()
         if frame is None:
             time.sleep(1)
             continue
-        
+
         frame = resize_if_needed(frame)
-        res = analyze_llm(name, frame) 
         save_last_frame(name, frame)
+        analysis_frame, frame_meta = preprocessor.prepare(frame)
+
+        if analysis_frame is None:
+            log(f"⏭️ [{name}] LLM skipped: low scene change ({frame_meta['changed_ratio']:.4f})")
+            for payload in flush_due_omnistatus_payloads():
+                send_omnistatus_payload(payload)
+            time.sleep(max(INTERVAL, MOTION_SKIP_SLEEP_SECONDS))
+            continue
+
+        res = analyze_llm(name, analysis_frame)
 
         score = res["score"]
         text = res["text"]
         log(f"")
         log(f"───────────────────────────────────────────────")
         log(f"📷  CAM: {name}")
+        if frame_meta.get("crop"):
+            log(f"   Frame: motion crop ({frame_meta.get('crop_area_ratio', 0):.1%} area, Δ={frame_meta['changed_ratio']:.4f})")
+        else:
+            log(f"   Frame: full ({frame_meta['reason']}, Δ={frame_meta['changed_ratio']:.4f})")
         log(f"   Score: {score:.2f}  |  {text}")
         log(f"───────────────────────────────────────────────")
 
@@ -316,6 +569,8 @@ def process_camera_analysis(stream: CameraStream):
                     last_tts_alert_at = now
         
         inject_omnistatus(name, text, score, image_b64=res["b64"])
+        for payload in flush_due_omnistatus_payloads():
+            send_omnistatus_payload(payload)
         
 
 
@@ -331,11 +586,12 @@ def send_telegram(img_b64: str, caption: str):
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
         data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1024]}
         files = {"photo": ("frame.jpg", base64.b64decode(img_b64), "image/jpeg")}
-        requests.post(url, data=data, files=files, timeout=20)
+        HTTP_SESSION.post(url, data=data, files=files, timeout=20)
     except Exception:
         pass
 
-def inject_omnistatus(source: str, text: str, score: float, image_b64: str = None):
+
+def send_omnistatus_payload(payload: dict):
     if not ENABLE_OMNISTATUS or not OMNISTATUS_API: return
     
     # Ensure URL ends with /event
@@ -346,21 +602,22 @@ def inject_omnistatus(source: str, text: str, score: float, image_b64: str = Non
         target_url = target_url.rstrip("/") + "/event"
 
     try:
-        payload = {"source": source, "text": text, "score": score}
-        if image_b64:
-            payload["image_b64"] = image_b64
-        # Debug log for 422 investigation
-        # log(f"Drafting OmniStatus payload: {json.dumps(payload)}", "debug")
-        
-        r = requests.post(target_url, json=payload, timeout=5)
+        r = HTTP_SESSION.post(target_url, json=payload, timeout=5)
         
         if r.status_code == 422:
             log(f"❌ OmniStatus 422 Unprocessable Entity! Response: {r.text} | Payload: {json.dumps(payload)}", "error")
         elif r.status_code != 200:
             log(f"⚠️ OmniStatus returned {r.status_code}: {r.text}", "warning")
+        elif payload.get("event_count", 1) > 1:
+            log(f"📦 OmniStatus grouped payload sent: {payload['source']} x{payload['event_count']}")
             
     except Exception as e:
         log(f"❌ OmniStatus Error: {e}", "error")
+
+
+def inject_omnistatus(source: str, text: str, score: float, image_b64: str = None):
+    for payload in collect_omnistatus_payloads(source, text, score, image_b64):
+        send_omnistatus_payload(payload)
 
 def heartbeat_loop():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or not HEARTBEAT_ENABLED: return
@@ -374,7 +631,7 @@ def heartbeat_loop():
             
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
             data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
-            requests.post(url, data=data, timeout=20)
+            HTTP_SESSION.post(url, data=data, timeout=20)
             log(f"💓 Heartbeat sent: {msg}")
         except Exception as e:
             log(f"❌ Heartbeat Error: {e}", "error")
@@ -399,6 +656,8 @@ def main():
     while True:
         try: time.sleep(1)
         except KeyboardInterrupt:
+            for payload in flush_all_omnistatus_payloads():
+                send_omnistatus_payload(payload)
             for s in streams.values(): s.stop()
             break
 

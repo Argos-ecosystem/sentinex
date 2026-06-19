@@ -141,8 +141,22 @@ RTSP_URL_PARKING=rtsp://user:password@192.168.1.12:554/stream
 FRAME_WIDTH=1280
 FRAME_HEIGHT=720
 FRAME_MAX_WIDTH=960              # Resize frames before sending to LLM
+JPEG_QUALITY=70                  # Lower quality makes the image smaller/faster
 INTERVAL=60                      # Seconds between captures
 LAST_FRAME_DIR=last_frames       # Directory to save frames
+
+# Motion pre-processing
+MOTION_FILTER_ENABLED=1          # Enable cheap frame pre-processing and optional motion crop
+MOTION_DOWNSCALE_WIDTH=320       # Cheap motion check resolution
+MOTION_DIFF_THRESHOLD=24         # Pixel difference needed to count as motion
+MOTION_MIN_CHANGED_RATIO=0.002   # Minimum changed area before analyzing
+MOTION_CROP_ENABLED=1            # Send only the motion crop when useful
+MOTION_CROP_PADDING=0.18         # Context around the motion box
+MOTION_CROP_MAX_AREA_RATIO=0.75  # Use full frame if crop is almost the whole image
+MOTION_SKIP_LOW_CHANGE=0         # Optional: skip VLLM on low scene change. Off by default to avoid missed static risks
+FULL_FRAME_EVERY_SECONDS=300     # Force periodic full-frame analysis
+MOTION_SKIP_SLEEP_SECONDS=1      # Avoid tight loops when INTERVAL=0 and frame is skipped
+MOTION_MAX_SKIPS_BEFORE_ANALYSIS=10 # Force analysis after repeated skips
 
 # ============================================================
 # 🧠 LLM CONFIGURATION
@@ -151,6 +165,8 @@ LM_STUDIO_API=http://localhost:1234/v1
 LM_STUDIO_PATH=/chat/completions
 MODEL_NAME=qwen3-vl-8b
 API_KEY=                         # Leave empty for local LM Studio
+LM_TIMEOUT=60
+LLM_MAX_TOKENS=220               # Keep output short; model only needs JSON
 
 # Default system prompt (used if no camera-specific prompt)
 SYSTEM_PROMPT=You are a cognitive sentinel. You observe camera images to detect human presence, anomalies, or risks. Always respond in valid JSON: {"description":"brief description", "score":0.0}
@@ -182,7 +198,12 @@ TELEGRAM_CHAT_ID=123456789
 # ============================================================
 ENABLE_OMNISTATUS=0
 OMNISTATUS_ENDPOINT=http://localhost:5000/api/status
+OMNISTATUS_DEDUP_ENABLED=1
+OMNISTATUS_DEDUP_WINDOW_SECONDS=30
+OMNISTATUS_DEDUP_MAX_SAMPLES=3
 ```
+
+When deduplication is enabled, Sentinex groups repeated events per camera and normalized text before sending them to OmniStatus. The payload keeps `text` and `score` for compatibility, and adds `event_count`, `avg_score`, `first_seen`, `last_seen`, `summary`, `dedup_key`, and `samples`.
 
 ---
 

@@ -205,25 +205,18 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Local env files
 .env.nano
 .env.server
-env_coqui/bin/fastapi
-env_coqui/bin/futurize
-env_coqui/bin/pasteurize
-env_coqui/bin/httpx
-env_coqui/bin/uvicorn
-<<<<<<< HEAD
-sentinex.log.2
-.gitignore
-sentinex.log.1
-last_frames/CAM3_last.jpg
-last_frames/CAM5_last.jpg
-sentinex.log.3
-=======
-last_frames/CAM8_last.jpg
+
+# Runtime outputs
 .DS_Store
-sentinex.log.1
-.DS_Store
->>>>>>> 59c21f7a6da8c6ff55253edaedd2630a9ed5c4cf
-last_frames/CAM5_last.jpg
-last_frames/CAM5_last.jpg
+*.log
+*.log.*
+last_frames/
+*.mp3
+*.wav
+
+# Local virtualenv used by this project
+env_coqui/
