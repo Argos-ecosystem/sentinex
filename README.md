@@ -178,13 +178,11 @@ SYSTEM_PROMPT_PARKING=You monitor the parking lot. Detect vehicle incidents, una
 # ============================================================
 # ⚠️ RISK SCORING & ALERTS
 # ============================================================
-SCORE_THRESHOLD=0.8              # Send alert if score >= this value
-HUMAN_ALERT_MIN_SCORE=0.2        # Minimum score for human presence alerts
-HUMAN_ALERT_COOLDOWN=300         # Default cooldown (seconds)
-
-# Per-camera cooldown overrides (optional)
-HUMAN_ALERT_COOLDOWN_CAM1=180
-HUMAN_ALERT_COOLDOWN_ENTRANCE=600
+# score < SCORE_TELEGRAM_ALERT: no external alert
+# SCORE_TELEGRAM_ALERT <= score < SCORE_CRITICAL_ALERT: Telegram only
+# score >= SCORE_CRITICAL_ALERT: Telegram + lights + TTS + siren
+SCORE_TELEGRAM_ALERT=0.8
+SCORE_CRITICAL_ALERT=0.95
 
 # ============================================================
 # 📲 TELEGRAM ALERTS
@@ -192,6 +190,27 @@ HUMAN_ALERT_COOLDOWN_ENTRANCE=600
 ENABLE_TELEGRAM=1
 TELEGRAM_BOT_TOKEN=123456789:ABCdefGHIjklMNOpqrsTUVwxyz
 TELEGRAM_CHAT_ID=123456789
+
+# Critical audio alert
+TTS_ENABLED=1
+TTS_MESSAGE="Alarma. Alarma. Alarma. Alarma crítica en el vivero."
+TTS_LANG=es
+TTS_COOLDOWN=60
+TTS_REPEATS=3
+TTS_REPEAT_DELAY=0.4
+SIREN_FILE=alarma_infernal.wav
+SIREN_COOLDOWN=30
+SIREN_MAX_SECONDS=4
+# Use one URL in CRITICAL_LIGHTS_WEBHOOK_URL or several comma-separated URLs here.
+CRITICAL_LIGHTS_WEBHOOK_URLS=
+CRITICAL_LIGHTS_WEBHOOK_URL=
+CRITICAL_LIGHTS_ACTION_NAME=focos_criticos
+CRITICAL_LIGHTS_COOLDOWN=30
+CRITICAL_LIGHTS_TIMEOUT=8
+CRITICAL_LIGHTS_OFF_WEBHOOK_URLS=
+CRITICAL_LIGHTS_OFF_WEBHOOK_URL=
+CRITICAL_LIGHTS_OFF_ACTION_NAME=apagar_foco
+CRITICAL_LIGHTS_AUTO_OFF_SECONDS=300
 
 # ============================================================
 # 📊 OMNISTATUS INTEGRATION (Optional)

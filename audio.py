@@ -1,35 +1,45 @@
-import numpy as np
-from scipy.io import wavfile
-from scipy import signal
+import math
+import struct
+import wave
 
 # --- CONFIGURACIÓN DE LA ALARMA ---
 fs = 44100           # Calidad de audio
 frecuencia_1 = 800   # Tono Alto (Hz)
 frecuencia_2 = 500   # Tono Bajo (Hz)
-velocidad = 0.4      # Cuánto dura cada "ui" (segundos)
-repeticiones = 8     # Cuántas veces hace "ui-u"
+velocidad = 0.25     # Cuánto dura cada "ui" (segundos)
+repeticiones = 8     # 8 ciclos de 0.5s = sirena de 4 segundos
 
 # --- GENERACIÓN ---
-# Creamos el tiempo para UN solo ciclo (el tono alto)
-t = np.linspace(0, velocidad, int(fs * velocidad), endpoint=False)
+def square_sample(frecuencia, idx):
+    return 0.5 if math.sin(2 * math.pi * frecuencia * idx / fs) >= 0 else -0.5
 
-# Generamos los dos trozos de audio (Onda Cuadrada pa que suene fuerte)
-# Si quieres que sea más suave, cambia 'signal.square' por 'np.sin'
-tono_alto = 0.5 * signal.square(2 * np.pi * frecuencia_1 * t)
-tono_bajo = 0.5 * signal.square(2 * np.pi * frecuencia_2 * t)
+muestras = []
+muestras_por_tono = int(fs * velocidad)
 
-# Pegamos los tonos: Alto -> Bajo
-ciclo_completo = np.concatenate((tono_alto, tono_bajo))
+for _ in range(repeticiones):
+    for i in range(muestras_por_tono):
+        muestras.append(square_sample(frecuencia_1, i))
+    for i in range(muestras_por_tono):
+        muestras.append(square_sample(frecuencia_2, i))
 
-# Repetimos el ciclo las veces que dijimos (pa que dure harto)
-alarma_final = np.tile(ciclo_completo, repeticiones)
+# Fade cortito para evitar clicks al inicio y al final.
+fade_muestras = int(fs * 0.02)
+for i in range(fade_muestras):
+    factor = i / fade_muestras
+    muestras[i] *= factor
+    muestras[-i - 1] *= factor
 
 # --- GUARDAR ---
 # Convertir a 16-bit
-datos_int16 = np.int16(alarma_final * 32767)
 nombre_archivo = 'alarma_infernal.wav'
+datos_int16 = b''.join(struct.pack('<h', int(muestra * 32767)) for muestra in muestras)
 
-wavfile.write(nombre_archivo, fs, datos_int16)
+with wave.open(nombre_archivo, 'wb') as wav:
+    wav.setnchannels(1)
+    wav.setsampwidth(2)
+    wav.setframerate(fs)
+    wav.writeframes(datos_int16)
 
 print(f"¡Listo el pollo! Se creó el archivo: {nombre_archivo}")
+print(f"Duración: {len(muestras) / fs:.1f} segundos.")
 print("Ábrelo con cuidado que suena juerte.")

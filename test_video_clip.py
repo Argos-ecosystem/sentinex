@@ -15,11 +15,18 @@ from datetime import datetime
 
 load_dotenv()
 
+def env_required(name: str) -> str:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value.strip()
+
+
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
-CLIP_FPS = float(os.getenv("CLIP_FPS", "8"))
-CLIP_PRE_SECONDS = float(os.getenv("CLIP_PRE_SECONDS", "3"))
-CLIP_POST_SECONDS = float(os.getenv("CLIP_POST_SECONDS", "3"))
+CLIP_FPS = float(env_required("CLIP_FPS"))
+CLIP_PRE_SECONDS = float(env_required("CLIP_PRE_SECONDS"))
+CLIP_POST_SECONDS = float(env_required("CLIP_POST_SECONDS"))
 
 def generate_test_frames(num_frames=48, width=480, height=360):
     """Genera frames sintéticos que simulan pre-evento, evento y post-evento."""

@@ -7,11 +7,19 @@ import httpx
 # Load .env.server configuration
 load_dotenv(".env.server")
 
+
+def env_required(name: str) -> str:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        raise RuntimeError(f"Missing required environment variable in .env.server: {name}")
+    return value.strip()
+
+
 # Base URL of LM Studio (WITHOUT /v1 suffix!)
-LM_STUDIO_URL = os.getenv("LM_STUDIO_URL").rstrip("/")
+LM_STUDIO_URL = env_required("LM_STUDIO_URL").rstrip("/")
 
 # Internal API KEY (can be any string)
-API_KEY = os.getenv("API_KEY", "12345")
+API_KEY = env_required("API_KEY")
 
 app = FastAPI()
 
