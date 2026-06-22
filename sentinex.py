@@ -792,7 +792,7 @@ def process_camera_analysis(stream: CameraStream):
             run_critical_action_sequence(name, res, score, text, critical_action_state)
 
         # === LEVEL 2: WARNING (TTS) ===
-        elif score >= SCORE_THRESHOLD: 
+        elif score >= SCORE_TELEGRAM_ALERT:
             send_telegram(res["b64"], f"⚠️ {name}: {text} | Risk={score:.2f}")
             if TTS_ENABLED:
                 now = time.time()
