@@ -87,6 +87,9 @@ OMNISTATUS_API = os.getenv("OMNISTATUS_ENDPOINT")
 OMNISTATUS_DEDUP_ENABLED = os.getenv("OMNISTATUS_DEDUP_ENABLED", "1") == "1"
 OMNISTATUS_DEDUP_WINDOW_SECONDS = float(os.getenv("OMNISTATUS_DEDUP_WINDOW_SECONDS", "30"))
 OMNISTATUS_DEDUP_MAX_SAMPLES = int(os.getenv("OMNISTATUS_DEDUP_MAX_SAMPLES", "3"))
+CRITICAL_WEBHOOK_URL = os.getenv("CRITICAL_WEBHOOK_URL")
+CRITICAL_CLEAR_WEBHOOK_URL = os.getenv("CRITICAL_CLEAR_WEBHOOK_URL")
+CRITICAL_WEBHOOK_COOLDOWN = float(os.getenv("CRITICAL_WEBHOOK_COOLDOWN", "30"))
 
 # TTS (Text-to-Speech) - WARNING LEVEL
 TTS_ENABLED = os.getenv("TTS_ENABLED", "0") == "1"
@@ -514,6 +517,8 @@ def process_camera_analysis(stream: CameraStream):
     log(f"🧠 [{name}] Consumer started.")
     last_tts_alert_at = 0.0
     last_siren_alert_at = 0.0
+    last_critical_webhook_at = 0.0
+    critical_webhook_active = False
     preprocessor = FramePreprocessor()
 
     while not stream.stopped:
@@ -558,8 +563,18 @@ def process_camera_analysis(stream: CameraStream):
             else:
                 log("⏳ Siren cooling down...")
 
+            if now - last_critical_webhook_at >= CRITICAL_WEBHOOK_COOLDOWN:
+                send_alert_webhook(CRITICAL_WEBHOOK_URL, "critical", name, score, text)
+                last_critical_webhook_at = now
+                critical_webhook_active = True
+            else:
+                log("⏳ Critical webhook cooling down...")
+
         # === LEVEL 2: WARNING (TTS) ===
         elif score >= SCORE_THRESHOLD: 
+            if critical_webhook_active:
+                send_alert_webhook(CRITICAL_CLEAR_WEBHOOK_URL, "critical_clear", name, score, text)
+                critical_webhook_active = False
             send_telegram(res["b64"], f"⚠️ {name}: {text} | Risk={score:.2f}")
             if TTS_ENABLED:
                 now = time.time()
@@ -567,6 +582,9 @@ def process_camera_analysis(stream: CameraStream):
                     log(f"🔊 Playing TTS for {name}")
                     play_audio_tts(TTS_MESSAGE, TTS_LANG, repeats=2, delay=1.0)
                     last_tts_alert_at = now
+        elif critical_webhook_active:
+            send_alert_webhook(CRITICAL_CLEAR_WEBHOOK_URL, "critical_clear", name, score, text)
+            critical_webhook_active = False
         
         inject_omnistatus(name, text, score, image_b64=res["b64"])
         for payload in flush_due_omnistatus_payloads():
@@ -589,6 +607,28 @@ def send_telegram(img_b64: str, caption: str):
         HTTP_SESSION.post(url, data=data, files=files, timeout=20)
     except Exception:
         pass
+
+
+def send_alert_webhook(url: Optional[str], level: str, source: str, score: float, text: str):
+    if not url:
+        return
+
+    payload = {
+        "source": source,
+        "score": score,
+        "text": text,
+        "level": level,
+        "ts": datetime.utcnow().isoformat() + "Z",
+    }
+
+    try:
+        response = HTTP_SESSION.post(url, json=payload, timeout=10)
+        if response.status_code >= 400:
+            log(f"⚠️ {level} webhook returned {response.status_code}", "warning")
+        else:
+            log(f"💡 {level} webhook sent")
+    except Exception as e:
+        log(f"❌ {level} webhook error: {e}", "error")
 
 
 def send_omnistatus_payload(payload: dict):
