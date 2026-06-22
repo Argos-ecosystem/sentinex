@@ -66,6 +66,10 @@ def env_str_first(*names: str, required: bool = True) -> str:
     return ""
 
 
+def env_str_first_default(default: str, *names: str) -> str:
+    return env_str_first(*names, required=False) or default
+
+
 def env_int(name: str) -> int:
     return int(env_str(name))
 
@@ -127,6 +131,7 @@ if SCORE_TELEGRAM_ALERT >= SCORE_CRITICAL_ALERT:
     raise RuntimeError("SCORE_TELEGRAM_ALERT must be lower than SCORE_CRITICAL_ALERT")
 
 # Integrations
+ENABLE_TELEGRAM = os.getenv("ENABLE_TELEGRAM", "0") == "1"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 ENABLE_OMNISTATUS = os.getenv("ENABLE_OMNISTATUS", "0") 
@@ -139,15 +144,15 @@ OMNISTATUS_DEDUP_MAX_SAMPLES = int(os.getenv("OMNISTATUS_DEDUP_MAX_SAMPLES", "3"
 TTS_ENABLED = env_bool("TTS_ENABLED")
 TTS_MESSAGE = env_str("TTS_MESSAGE")
 TTS_LANG = env_str("TTS_LANG")
-TTS_COOLDOWN = env_float("TTS_COOLDOWN")
-TTS_REPEATS = env_int("TTS_REPEATS")
-TTS_REPEAT_DELAY = env_float("TTS_REPEAT_DELAY")
+TTS_COOLDOWN = float(env_str_first_default("60", "TTS_COOLDOWN"))
+TTS_REPEATS = int(env_str_first_default("2", "TTS_REPEATS"))
+TTS_REPEAT_DELAY = float(env_str_first_default("1.0", "TTS_REPEAT_DELAY"))
 
 # SIREN (Audio File) - CRITICAL LEVEL
 # AQUI: Asegúrate que este nombre coincida con tu archivo generado
-SIREN_FILE = env_str("SIREN_FILE")
-SIREN_COOLDOWN = env_float("SIREN_COOLDOWN")
-SIREN_MAX_SECONDS = env_float("SIREN_MAX_SECONDS")
+SIREN_FILE = env_str_first_default("alarma_infernal.wav", "SIREN_FILE")
+SIREN_COOLDOWN = float(env_str_first_default("30", "SIREN_COOLDOWN"))
+SIREN_MAX_SECONDS = float(env_str_first_default("0", "SIREN_MAX_SECONDS"))
 
 # Heartbeat
 HEARTBEAT_ENABLED = env_bool("HEARTBEAT_ENABLED")
@@ -173,12 +178,17 @@ def parse_webhook_urls(*raw_values: str) -> List[str]:
 
 CRITICAL_LIGHTS_WEBHOOK_URLS = parse_webhook_urls(
     env_str("CRITICAL_LIGHTS_WEBHOOK_URLS", required=False),
-    CRITICAL_LIGHTS_WEBHOOK_URL,
+    env_str_first("CRITICAL_LIGHTS_WEBHOOK_URL", "CRITICAL_WEBHOOK_URL", required=False),
 )
 CRITICAL_LIGHTS_OFF_WEBHOOK_URLS = parse_webhook_urls(
     env_str("CRITICAL_LIGHTS_OFF_WEBHOOK_URLS", required=False),
-    CRITICAL_LIGHTS_OFF_WEBHOOK_URL,
+    env_str_first("CRITICAL_LIGHTS_OFF_WEBHOOK_URL", "CRITICAL_CLEAR_WEBHOOK_URL", required=False),
 )
+CRITICAL_LIGHTS_ACTION_NAME = env_str_first_default("focos_criticos", "CRITICAL_LIGHTS_ACTION_NAME")
+CRITICAL_LIGHTS_OFF_ACTION_NAME = env_str_first_default("apagar_foco", "CRITICAL_LIGHTS_OFF_ACTION_NAME")
+CRITICAL_LIGHTS_COOLDOWN = float(env_str_first_default("30", "CRITICAL_LIGHTS_COOLDOWN", "CRITICAL_WEBHOOK_COOLDOWN"))
+CRITICAL_LIGHTS_TIMEOUT = float(env_str_first_default("8", "CRITICAL_LIGHTS_TIMEOUT"))
+CRITICAL_LIGHTS_AUTO_OFF_SECONDS = float(env_str_first_default("0", "CRITICAL_LIGHTS_AUTO_OFF_SECONDS"))
 
 
 # ============================================================
