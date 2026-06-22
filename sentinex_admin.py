@@ -3,16 +3,26 @@ import os
 from pathlib import Path
 from urllib.parse import quote
 
-from dotenv import dotenv_values, set_key, unset_key
+from dotenv import dotenv_values, load_dotenv, set_key, unset_key
 from fastapi import FastAPI, Form
 from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.responses import FileResponse
 
 
-ENV_FILE = Path(os.getenv("SENTINEX_ENV_FILE", ".env"))
-_last_dir = Path(os.getenv("LAST_FRAME_DIR", "last_frames"))
+ENV_FILE = Path(os.environ.get("SENTINEX_ENV_FILE") or ".env")
+load_dotenv(ENV_FILE)
+
+
+def env_required(name: str) -> str:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value.strip()
+
+
+_last_dir = Path(env_required("LAST_FRAME_DIR"))
 LAST_FRAME_DIR = _last_dir if _last_dir.is_absolute() else Path(__file__).resolve().parent / _last_dir
-REFRESH_MS = int(os.getenv("ADMIN_REFRESH_MS", "15000"))
+REFRESH_MS = int(env_required("ADMIN_REFRESH_MS"))
 APP_TITLE = "Sentinex Admin"
 
 app = FastAPI(title=APP_TITLE)

@@ -11,7 +11,6 @@ import json
 import logging
 import io
 import re
-import socket
 from logging.handlers import RotatingFileHandler
 from threading import Thread, Lock
 from datetime import datetime
@@ -46,38 +45,86 @@ def load_cameras_from_env():
 
 CAMERAS = load_cameras_from_env()
 
+
+def env_str(name: str, required: bool = True) -> str:
+    value = os.getenv(name)
+    if value is None or value.strip() == "":
+        if required:
+            raise RuntimeError(f"Missing required environment variable: {name}")
+        return ""
+    return value.strip()
+
+
+def env_str_first(*names: str, required: bool = True) -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and value.strip() != "":
+            return value.strip()
+    if required:
+        joined = " or ".join(names)
+        raise RuntimeError(f"Missing required environment variable: {joined}")
+    return ""
+
+
+def env_int(name: str) -> int:
+    return int(env_str(name))
+
+
+def env_float(name: str) -> float:
+    return float(env_str(name))
+
+
+def env_float_first(*names: str) -> float:
+    return float(env_str_first(*names))
+
+
+def env_bool(name: str) -> bool:
+    value = env_str(name).lower()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean value: 1/0, true/false, yes/no, on/off")
+
+
 # Frame and Scaling settings
-FRAME_MAX_WIDTH = int(os.getenv("FRAME_MAX_WIDTH", "960"))
-INTERVAL = float(os.getenv("INTERVAL", "0")) # Set to 0 for max speed
-JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "70"))
-LAST_FRAME_DIR = os.getenv("LAST_FRAME_DIR", "last_frames")
-MOTION_FILTER_ENABLED = os.getenv("MOTION_FILTER_ENABLED", "1") == "1"
-MOTION_DOWNSCALE_WIDTH = int(os.getenv("MOTION_DOWNSCALE_WIDTH", "320"))
-MOTION_DIFF_THRESHOLD = int(os.getenv("MOTION_DIFF_THRESHOLD", "24"))
-MOTION_MIN_CHANGED_RATIO = float(os.getenv("MOTION_MIN_CHANGED_RATIO", "0.002"))
-MOTION_CROP_ENABLED = os.getenv("MOTION_CROP_ENABLED", "1") == "1"
-MOTION_CROP_PADDING = float(os.getenv("MOTION_CROP_PADDING", "0.18"))
-MOTION_CROP_MAX_AREA_RATIO = float(os.getenv("MOTION_CROP_MAX_AREA_RATIO", "0.75"))
-MOTION_SKIP_LOW_CHANGE = os.getenv("MOTION_SKIP_LOW_CHANGE", "0") == "1"
-FULL_FRAME_EVERY_SECONDS = float(os.getenv("FULL_FRAME_EVERY_SECONDS", "300"))
-MOTION_SKIP_SLEEP_SECONDS = float(os.getenv("MOTION_SKIP_SLEEP_SECONDS", "1"))
-MOTION_MAX_SKIPS_BEFORE_ANALYSIS = int(os.getenv("MOTION_MAX_SKIPS_BEFORE_ANALYSIS", "10"))
+FRAME_MAX_WIDTH = env_int("FRAME_MAX_WIDTH")
+INTERVAL = env_float("INTERVAL") # Set to 0 for max speed
+JPEG_QUALITY = env_int("JPEG_QUALITY")
+LAST_FRAME_DIR = env_str("LAST_FRAME_DIR")
+MOTION_FILTER_ENABLED = env_bool("MOTION_FILTER_ENABLED")
+MOTION_DOWNSCALE_WIDTH = env_int("MOTION_DOWNSCALE_WIDTH")
+MOTION_DIFF_THRESHOLD = env_int("MOTION_DIFF_THRESHOLD")
+MOTION_MIN_CHANGED_RATIO = env_float("MOTION_MIN_CHANGED_RATIO")
+MOTION_CROP_ENABLED = env_bool("MOTION_CROP_ENABLED")
+MOTION_CROP_PADDING = env_float("MOTION_CROP_PADDING")
+MOTION_CROP_MAX_AREA_RATIO = env_float("MOTION_CROP_MAX_AREA_RATIO")
+MOTION_SKIP_LOW_CHANGE = env_bool("MOTION_SKIP_LOW_CHANGE")
+FULL_FRAME_EVERY_SECONDS = env_float("FULL_FRAME_EVERY_SECONDS")
+MOTION_SKIP_SLEEP_SECONDS = env_float("MOTION_SKIP_SLEEP_SECONDS")
+MOTION_MAX_SKIPS_BEFORE_ANALYSIS = env_int("MOTION_MAX_SKIPS_BEFORE_ANALYSIS")
 
 # LLM API Settings
-LM_API = os.getenv("LM_STUDIO_API", "").rstrip("/")
-LM_PATH = os.getenv("LM_STUDIO_PATH", "/chat/completions")
-MODEL_NAME = os.getenv("MODEL_NAME", "qwen3-vl-8b")
-API_KEY = os.getenv("API_KEY")
-LM_TIMEOUT = float(os.getenv("LM_TIMEOUT", "60"))
-LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "220"))
+LM_API = env_str("LM_STUDIO_API").rstrip("/")
+LM_PATH = env_str("LM_STUDIO_PATH")
+MODEL_NAME = env_str("MODEL_NAME")
+API_KEY = env_str("API_KEY", required=False)
+LM_TIMEOUT = env_float("LM_TIMEOUT")
+LLM_MAX_TOKENS = env_int("LLM_MAX_TOKENS")
+SYSTEM_PROMPT = env_str("SYSTEM_PROMPT")
 
 # Persistent HTTP session to reuse keep-alive connections and avoid repeated TCP handshakes
 HTTP_SESSION = requests.Session()
 HTTP_SESSION.trust_env = False
 
-# --- DECISION THRESHOLDS ---
-SCORE_THRESHOLD = float(os.getenv("SCORE_THRESHOLD", "0.25")) # Warning
-SCORE_CRITICAL = float(os.getenv("SCORE_CRITICAL", "0.45"))   # Siren
+# Alert levels:
+# score < SCORE_TELEGRAM_ALERT => no external alert
+# SCORE_TELEGRAM_ALERT <= score < SCORE_CRITICAL_ALERT => Telegram only
+# score >= SCORE_CRITICAL_ALERT => Telegram + lights + TTS + siren
+SCORE_TELEGRAM_ALERT = env_float_first("SCORE_TELEGRAM_ALERT", "SCORE_THRESHOLD")
+SCORE_CRITICAL_ALERT = env_float_first("SCORE_CRITICAL_ALERT", "SCORE_CRITICAL")
+if SCORE_TELEGRAM_ALERT >= SCORE_CRITICAL_ALERT:
+    raise RuntimeError("SCORE_TELEGRAM_ALERT must be lower than SCORE_CRITICAL_ALERT")
 
 # Integrations
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -87,29 +134,51 @@ OMNISTATUS_API = os.getenv("OMNISTATUS_ENDPOINT")
 OMNISTATUS_DEDUP_ENABLED = os.getenv("OMNISTATUS_DEDUP_ENABLED", "1") == "1"
 OMNISTATUS_DEDUP_WINDOW_SECONDS = float(os.getenv("OMNISTATUS_DEDUP_WINDOW_SECONDS", "30"))
 OMNISTATUS_DEDUP_MAX_SAMPLES = int(os.getenv("OMNISTATUS_DEDUP_MAX_SAMPLES", "3"))
-CRITICAL_WEBHOOK_URL = os.getenv("CRITICAL_WEBHOOK_URL")
-CRITICAL_CLEAR_WEBHOOK_URL = os.getenv("CRITICAL_CLEAR_WEBHOOK_URL")
-CRITICAL_WEBHOOK_COOLDOWN = float(os.getenv("CRITICAL_WEBHOOK_COOLDOWN", "30"))
 
-# TTS (Text-to-Speech) - WARNING LEVEL
-TTS_ENABLED = os.getenv("TTS_ENABLED", "0") == "1"
-TTS_MESSAGE = os.getenv("TTS_MESSAGE", "Alexa enciende el desierto 15 segundos.")
-TTS_LANG = os.getenv("TTS_LANG", "es") 
-TTS_COOLDOWN = float(os.getenv("TTS_COOLDOWN", "60"))
+# TTS (Text-to-Speech) - CRITICAL LEVEL
+TTS_ENABLED = env_bool("TTS_ENABLED")
+TTS_MESSAGE = env_str("TTS_MESSAGE")
+TTS_LANG = env_str("TTS_LANG")
+TTS_COOLDOWN = env_float("TTS_COOLDOWN")
+TTS_REPEATS = env_int("TTS_REPEATS")
+TTS_REPEAT_DELAY = env_float("TTS_REPEAT_DELAY")
 
 # SIREN (Audio File) - CRITICAL LEVEL
 # AQUI: Asegúrate que este nombre coincida con tu archivo generado
-SIREN_FILE = os.getenv("SIREN_FILE", "alarma_infernal.wav") 
-SIREN_COOLDOWN = float(os.getenv("SIREN_COOLDOWN", "30"))
+SIREN_FILE = env_str("SIREN_FILE")
+SIREN_COOLDOWN = env_float("SIREN_COOLDOWN")
+SIREN_MAX_SECONDS = env_float("SIREN_MAX_SECONDS")
 
 # Heartbeat
-HEARTBEAT_ENABLED = os.getenv("HEARTBEAT_ENABLED", "1") 
-HEARTBEAT_INTERVAL = float(os.getenv("HEARTBEAT_INTERVAL", "14400"))
+HEARTBEAT_ENABLED = env_bool("HEARTBEAT_ENABLED")
+HEARTBEAT_INTERVAL = env_float("HEARTBEAT_INTERVAL")
+SENTINEX_INSTANCE_NAME = env_str("SENTINEX_INSTANCE_NAME")
 
 # Logging
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-LOG_FILE = os.getenv("LOG_FILE", "sentinex.log")
+LOG_LEVEL = env_str("LOG_LEVEL").upper()
+LOG_FILE = env_str("LOG_FILE")
 
+
+def parse_webhook_urls(*raw_values: str) -> List[str]:
+    urls = []
+    seen = set()
+    for raw_value in raw_values:
+        for url in (raw_value or "").split(","):
+            url = url.strip()
+            if url and url not in seen:
+                urls.append(url)
+                seen.add(url)
+    return urls
+
+
+CRITICAL_LIGHTS_WEBHOOK_URLS = parse_webhook_urls(
+    env_str("CRITICAL_LIGHTS_WEBHOOK_URLS", required=False),
+    CRITICAL_LIGHTS_WEBHOOK_URL,
+)
+CRITICAL_LIGHTS_OFF_WEBHOOK_URLS = parse_webhook_urls(
+    env_str("CRITICAL_LIGHTS_OFF_WEBHOOK_URLS", required=False),
+    CRITICAL_LIGHTS_OFF_WEBHOOK_URL,
+)
 
 
 # ============================================================
@@ -406,8 +475,14 @@ def play_audio_tts(text: str, lang: str = "es", repeats: int = 1, delay: float =
         log(f"❌ TTS playback error: {e}", "error")
 
 
+_siren_sound = None
+_siren_sound_path = None
+
+
 def play_siren_file():
     """Plays the local siren WAV/MP3 file at max volume."""
+    global _siren_sound, _siren_sound_path
+
     if not os.path.exists(SIREN_FILE):
         log(f"❌ Siren file not found at: {SIREN_FILE}", "error")
         return
@@ -415,16 +490,168 @@ def play_siren_file():
     try:
         if not pygame.mixer.get_init():
             pygame.mixer.init()
+
+        maxtime = int(SIREN_MAX_SECONDS * 1000) if SIREN_MAX_SECONDS > 0 else 0
+        if _siren_sound is None or _siren_sound_path != SIREN_FILE:
+            _siren_sound = pygame.mixer.Sound(SIREN_FILE)
+            _siren_sound_path = SIREN_FILE
+
+        _siren_sound.set_volume(1.0)
+        _siren_sound.play(maxtime=maxtime)
         
-        # Load and play
-        pygame.mixer.music.load(SIREN_FILE)
-        pygame.mixer.music.set_volume(1.0) 
-        pygame.mixer.music.play()
-        
-        log(f"🔊 SIREN ACTIVATED 🚨 ({SIREN_FILE})")
+        log(f"🔊 SIREN ACTIVATED 🚨 ({SIREN_FILE}, max {SIREN_MAX_SECONDS:.1f}s)")
         
     except Exception as e:
         log(f"❌ Siren playback error: {e}", "error")
+
+
+def call_webhook_urls(webhook_urls: List[str], action_name: str, camera_name: str, score: float, text: str) -> int:
+    payload = {
+        "value1": camera_name,
+        "value2": f"{score:.2f}",
+        "value3": text[:512],
+    }
+    sent_count = 0
+
+    for idx, webhook_url in enumerate(webhook_urls, start=1):
+        try:
+            r = HTTP_SESSION.post(
+                webhook_url,
+                json=payload,
+                timeout=CRITICAL_LIGHTS_TIMEOUT,
+            )
+            if r.status_code >= 400:
+                log(f"⚠️ Webhook {action_name} #{idx} returned {r.status_code}: {r.text[:200]}", "warning")
+                continue
+            sent_count += 1
+        except Exception as e:
+            log(f"❌ Webhook {action_name} #{idx} error: {e}", "error")
+
+    return sent_count
+
+
+def call_critical_lights_webhook(camera_name: str, score: float, text: str):
+    """Calls the configured IFTTT webhook for critical light-on actions."""
+    if not CRITICAL_LIGHTS_WEBHOOK_URLS:
+        return
+
+    sent_count = call_webhook_urls(
+        CRITICAL_LIGHTS_WEBHOOK_URLS,
+        CRITICAL_LIGHTS_ACTION_NAME,
+        camera_name,
+        score,
+        text,
+    )
+
+    if sent_count:
+        log(f"💡 Critical lights action sent: {CRITICAL_LIGHTS_ACTION_NAME} ({sent_count}/{len(CRITICAL_LIGHTS_WEBHOOK_URLS)})")
+
+
+def call_critical_lights_off_webhook(camera_name: str, score: float, text: str):
+    """Calls the configured IFTTT webhook for critical light-off actions."""
+    if not CRITICAL_LIGHTS_OFF_WEBHOOK_URLS:
+        return
+
+    sent_count = call_webhook_urls(
+        CRITICAL_LIGHTS_OFF_WEBHOOK_URLS,
+        CRITICAL_LIGHTS_OFF_ACTION_NAME,
+        camera_name,
+        score,
+        text,
+    )
+
+    if sent_count:
+        log(f"💡 Critical lights off action sent: {CRITICAL_LIGHTS_OFF_ACTION_NAME} ({sent_count}/{len(CRITICAL_LIGHTS_OFF_WEBHOOK_URLS)})")
+
+
+def schedule_critical_lights_off(camera_name: str, score: float, text: str, action_state: dict):
+    if not CRITICAL_LIGHTS_OFF_WEBHOOK_URLS or CRITICAL_LIGHTS_AUTO_OFF_SECONDS <= 0:
+        return
+
+    action_state["lights_off_generation"] = action_state.get("lights_off_generation", 0) + 1
+    generation = action_state["lights_off_generation"]
+    delay = CRITICAL_LIGHTS_AUTO_OFF_SECONDS
+
+    def delayed_off():
+        time.sleep(delay)
+        if action_state.get("lights_off_generation") != generation:
+            return
+        call_critical_lights_off_webhook(camera_name, score, text)
+
+    Thread(target=delayed_off, daemon=True).start()
+    log(f"⏲️ Critical lights off scheduled in {delay:.0f}s")
+
+
+def run_critical_lights_action(name: str, score: float, text: str, action_state: dict):
+    if CRITICAL_LIGHTS_WEBHOOK_URLS:
+        run_with_cooldown(
+            action_state,
+            "lights",
+            CRITICAL_LIGHTS_COOLDOWN,
+            "⏳ Critical lights webhook cooling down...",
+            lambda: call_critical_lights_webhook(name, score, text),
+        )
+    schedule_critical_lights_off(name, score, text, action_state)
+
+
+def run_with_cooldown(action_state: dict, action_key: str, cooldown: float, cooldown_message: str, action):
+    now = time.time()
+    if now - action_state.get(action_key, 0.0) < cooldown:
+        log(cooldown_message)
+        return
+
+    action_state[action_key] = now
+    action()
+
+
+def run_action_sequence(sequence_name: str, actions: list):
+    log(f"⚡ Running action sequence: {sequence_name}")
+    for action_name, action in actions:
+        try:
+            action()
+        except Exception as e:
+            log(f"❌ Action failed ({action_name}): {e}", "error")
+
+
+def run_critical_action_sequence(name: str, res: dict, score: float, text: str, action_state: dict):
+    actions = [
+        (
+            "telegram",
+            lambda: send_telegram(res["b64"], f"🚨🔴 CRITICAL: {name} | Score={score:.2f}\n{text}"),
+        ),
+    ]
+
+    if CRITICAL_LIGHTS_WEBHOOK_URLS or CRITICAL_LIGHTS_OFF_WEBHOOK_URLS:
+        actions.append((
+            "lights",
+            lambda: run_critical_lights_action(name, score, text, action_state),
+        ))
+
+    if TTS_ENABLED:
+        actions.append((
+            "tts",
+            lambda: run_with_cooldown(
+                action_state,
+                "tts",
+                TTS_COOLDOWN,
+                "⏳ Critical TTS cooling down...",
+                lambda: play_audio_tts(TTS_MESSAGE, TTS_LANG, repeats=TTS_REPEATS, delay=TTS_REPEAT_DELAY),
+            ),
+        ))
+
+    actions.append(
+        (
+            "siren",
+            lambda: run_with_cooldown(
+                action_state,
+                "siren",
+                SIREN_COOLDOWN,
+                "⏳ Siren cooling down...",
+                play_siren_file,
+            ),
+        ),
+    )
+    run_action_sequence("critical_edge", actions)
 
 
 class CameraStream:
@@ -485,7 +712,7 @@ class CameraStream:
 def analyze_llm(camera_name, frame) -> dict:
     img_b64 = to_b64_jpg(frame)
     img_data_uri = f"data:image/jpeg;base64,{img_b64}"
-    system_prompt = os.getenv(f"SYSTEM_PROMPT_{camera_name}", os.getenv("SYSTEM_PROMPT", ""))
+    system_prompt = env_str(f"SYSTEM_PROMPT_{camera_name}", required=False) or SYSTEM_PROMPT
 
     payload = {
         "model": MODEL_NAME,
@@ -517,8 +744,6 @@ def process_camera_analysis(stream: CameraStream):
     log(f"🧠 [{name}] Consumer started.")
     last_tts_alert_at = 0.0
     last_siren_alert_at = 0.0
-    last_critical_webhook_at = 0.0
-    critical_webhook_active = False
     preprocessor = FramePreprocessor()
 
     while not stream.stopped:
@@ -552,29 +777,12 @@ def process_camera_analysis(stream: CameraStream):
         log(f"   Score: {score:.2f}  |  {text}")
         log(f"───────────────────────────────────────────────")
 
-        # === LEVEL 1: CRITICAL THREAT (SIREN) ===
-        if score >= SCORE_CRITICAL:
-            send_telegram(res["b64"], f"🚨🔴 CRITICAL: {name} | Score={score:.2f}\n{text}")
-            
-            now = time.time()
-            if now - last_siren_alert_at >= SIREN_COOLDOWN:
-                play_siren_file()
-                last_siren_alert_at = now
-            else:
-                log("⏳ Siren cooling down...")
-
-            if now - last_critical_webhook_at >= CRITICAL_WEBHOOK_COOLDOWN:
-                send_alert_webhook(CRITICAL_WEBHOOK_URL, "critical", name, score, text)
-                last_critical_webhook_at = now
-                critical_webhook_active = True
-            else:
-                log("⏳ Critical webhook cooling down...")
+        # === CRITICAL ALERT: TELEGRAM + LIGHTS + TTS + SIREN ===
+        if score >= SCORE_CRITICAL_ALERT:
+            run_critical_action_sequence(name, res, score, text, critical_action_state)
 
         # === LEVEL 2: WARNING (TTS) ===
         elif score >= SCORE_THRESHOLD: 
-            if critical_webhook_active:
-                send_alert_webhook(CRITICAL_CLEAR_WEBHOOK_URL, "critical_clear", name, score, text)
-                critical_webhook_active = False
             send_telegram(res["b64"], f"⚠️ {name}: {text} | Risk={score:.2f}")
             if TTS_ENABLED:
                 now = time.time()
@@ -582,9 +790,6 @@ def process_camera_analysis(stream: CameraStream):
                     log(f"🔊 Playing TTS for {name}")
                     play_audio_tts(TTS_MESSAGE, TTS_LANG, repeats=2, delay=1.0)
                     last_tts_alert_at = now
-        elif critical_webhook_active:
-            send_alert_webhook(CRITICAL_CLEAR_WEBHOOK_URL, "critical_clear", name, score, text)
-            critical_webhook_active = False
         
         inject_omnistatus(name, text, score, image_b64=res["b64"])
         for payload in flush_due_omnistatus_payloads():
@@ -599,7 +804,7 @@ def process_camera_analysis(stream: CameraStream):
 # ============================================================
 
 def send_telegram(img_b64: str, caption: str):
-    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
+    if not ENABLE_TELEGRAM or not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID: return
     try:
         url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto"
         data = {"chat_id": TELEGRAM_CHAT_ID, "caption": caption[:1024]}
@@ -661,13 +866,11 @@ def inject_omnistatus(source: str, text: str, score: float, image_b64: str = Non
 
 def heartbeat_loop():
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID or not HEARTBEAT_ENABLED: return
-    hostname = socket.gethostname()
-    instance_name = os.getenv("SENTINEX_INSTANCE_NAME", f"Sentinex-{hostname}")
 
     while True:
         try:
             now_str = time.strftime("%Y-%m-%d %H:%M:%S")
-            msg = f"🟢 {instance_name} Online | 📅 {now_str}"
+            msg = f"🟢 {SENTINEX_INSTANCE_NAME} Online | 📅 {now_str}"
             
             url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
             data = {"chat_id": TELEGRAM_CHAT_ID, "text": msg}
